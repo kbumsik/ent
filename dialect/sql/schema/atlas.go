@@ -299,7 +299,6 @@ type (
 		fmt              migrate.Formatter
 		genSum           bool
 		typeStoreConsent bool
-		planMutations    []func(*migrate.Plan) // run mutations on a migrate.Plan, like adding custom SQL.
 	}
 
 	// atBuilder must be implemented by the different drivers in
