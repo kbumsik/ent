@@ -784,3 +784,7 @@ func (d *Postgres) atIndex(idx1 *Index, t2 *schema.Table, idx2 *schema.Index) er
 	}
 	return nil
 }
+
+func (Postgres) atTypeRangeSQL(t string) string {
+	return fmt.Sprintf(`INSERT INTO "%s" ("type") VALUES ('%s')`, TypeTable, t)
+}

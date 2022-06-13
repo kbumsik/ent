@@ -7,8 +7,10 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -271,16 +273,33 @@ func WithSumFile() MigrateOption {
 	}
 }
 
+// WithDeterministicGlobalUniqueID instructs atlas to use a file based type store when
+// global unique ids are enabled. For more information see the setupAtlas method on Migrate.
+//
+// ATTENTION:
+// The file based pk range store is not backwards compatible, since the allocated ranges were computed
+// dynamically when computing the diff between a deployed database and the current schema. In cases where there
+// exist multiple deployments, the allocated ranges for the same type might be different from each other,
+// depending on when the deployment took part.
+func WithDeterministicGlobalUniqueID() MigrateOption {
+	return func(m *Migrate) {
+		m.universalID = true
+		m.atlas.typeStoreConsent = true
+	}
+}
+
 type (
 	// atlasOptions describes the options for atlas.
 	atlasOptions struct {
-		enabled bool
-		diff    []DiffHook
-		apply   []ApplyHook
-		skip    ChangeKind
-		dir     migrate.Dir
-		fmt     migrate.Formatter
-		genSum  bool
+		enabled          bool
+		diff             []DiffHook
+		apply            []ApplyHook
+		skip             ChangeKind
+		dir              migrate.Dir
+		fmt              migrate.Formatter
+		genSum           bool
+		typeStoreConsent bool
+		planMutations    []func(*migrate.Plan) // run mutations on a migrate.Plan, like adding custom SQL.
 	}
 
 	// atBuilder must be implemented by the different drivers in
@@ -293,8 +312,11 @@ type (
 		atIncrementC(*schema.Table, *schema.Column)
 		atIncrementT(*schema.Table, int64)
 		atIndex(*Index, *schema.Table, *schema.Index) error
+		atTypeRangeSQL(t string) string
 	}
 )
+
+var errConsent = errors.New("sql/schema: use WithDeterministicGlobalUniqueID() instead of WithGlobalUniqueID(true) and WithDir(): ") // TODO(masseelch): add link to docs here
 
 func (m *Migrate) setupAtlas() error {
 	// Using one of the Atlas options, opt-in to Atlas migration.
@@ -325,6 +347,18 @@ func (m *Migrate) setupAtlas() error {
 	}
 	if m.atlas.dir != nil && m.atlas.fmt == nil {
 		m.atlas.fmt = sqltool.GolangMigrateFormatter
+	}
+	if m.universalID && m.atlas.dir != nil {
+		// If global unique ids and a migration directory is given, enable the file based type store for pk ranges.
+		m.typeStore = &dirTypeStore{dir: m.atlas.dir}
+		// The file based pk range store is not backwards compatible, since the allocated ranges were computed
+		// dynamically when computing the diff between a deployed database and the current schema. In cases where there
+		// exist multiple deployments, the allocated ranges for the same type might be different from each other,
+		// depending on when the deployment took part. To guard the user against bugs, the file based type store must
+		// be enabled by an option.
+		if !m.atlas.typeStoreConsent {
+			return errConsent
+		}
 	}
 	return nil
 }
@@ -574,3 +608,53 @@ func descIndexes(idx *Index) map[string]bool {
 	}
 	return descs
 }
+
+const entTypes = ".ent_types"
+
+// dirTypeStore stores and read pk information from a text file stored alongside generated versioned migrations.
+// This behaviour is enabled automatically when using versioned migrations.
+type dirTypeStore struct {
+	dir      migrate.Dir
+	newTypes []string // store types added in this run
+}
+
+// load the types from the types file.
+func (s *dirTypeStore) load(context.Context, dialect.ExecQuerier) ([]string, error) {
+	f, err := s.dir.Open(entTypes)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading types file: %w", err)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	var ts []string
+	if err := json.NewDecoder(f).Decode(&ts); err != nil {
+		return nil, fmt.Errorf("decoding types: %w", err)
+	}
+	return ts, nil
+}
+
+// add a new type entry to the types file.
+func (s *dirTypeStore) add(ctx context.Context, conn dialect.ExecQuerier, t string) error {
+	// If this is the TypeTable added, it is due to the fact that with versioned migrations we add the TypeTable
+	// to the tables we need the diff for (to create it in case it is missing). Do not report that and do not allocate
+	// a pk range for it.
+	if t == TypeTable {
+		return nil
+	}
+	ts, err := s.load(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("adding type %q: %w", t, err)
+	}
+	b, err := json.Marshal(append(ts, t))
+	if err != nil {
+		return fmt.Errorf("encoding types: %w", err)
+	}
+	if err := s.dir.WriteFile(entTypes, b); err != nil {
+		return fmt.Errorf("writing types file: %w", err)
+	}
+	s.newTypes = append(s.newTypes, t)
+	return nil
+}
+
+var _ typeStore = (*dirTypeStore)(nil)

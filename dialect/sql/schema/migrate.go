@@ -12,6 +12,7 @@ import (
 	"math"
 
 	"ariga.io/atlas/sql/migrate"
+	"ariga.io/atlas/sql/schema"
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
 	"entgo.io/ent/schema/field"
@@ -163,14 +164,14 @@ func (m *Migrate) Create(ctx context.Context, tables ...*Table) error {
 	return creator.Create(ctx, tables...)
 }
 
-// Diff compares the state read from the StateReader with the state defined by Ent.
-// Changes will be written to migration files by the configures Planner.
+// Diff compares the state read from the connected database with the state defined by Ent.
+// Changes will be written to migration files by the configured Planner.
 func (m *Migrate) Diff(ctx context.Context, tables ...*Table) error {
 	return m.NamedDiff(ctx, "changes", tables...)
 }
 
-// NamedDiff compares the state read from the StateReader with the state defined by Ent.
-// Changes will be written to migration files by the configures Planner.
+// NamedDiff compares the state read from the connected database with the state defined by Ent.
+// Changes will be written to migration files by the configured Planner.
 func (m *Migrate) NamedDiff(ctx context.Context, name string, tables ...*Table) error {
 	if m.atlas.dir == nil {
 		return errors.New("no migration directory given")
@@ -182,10 +183,44 @@ func (m *Migrate) NamedDiff(ctx context.Context, name string, tables ...*Table) 
 		if err := m.types(ctx, m); err != nil {
 			return err
 		}
+		m.atlas.diff = append(m.atlas.diff, func(next Differ) Differ {
+			return DiffFunc(func(current, desired *schema.Schema) ([]schema.Change, error) {
+				// Make sure the TypeTable exists.
+				exists, err := m.tableExist(ctx, m, TypeTable)
+				if err != nil {
+					return nil, err
+				}
+				if !exists {
+					var (
+						at = schema.NewTable(TypeTable)
+						et = NewTable(TypeTable).
+							AddPrimary(&Column{Name: "id", Type: field.TypeUint, Increment: true}).
+							AddColumn(&Column{Name: "type", Type: field.TypeString, Unique: true})
+					)
+					m.atTable(et, at)
+					if err := m.aColumns(m, et, at); err != nil {
+						return nil, err
+					}
+					desired.Tables = append(desired.Tables, at)
+				}
+				return next.Diff(current, desired)
+			})
+		})
 	}
 	plan, err := m.atDiff(ctx, m, name, tables...)
 	if err != nil {
 		return err
+	}
+	if m.universalID {
+		// Add the required entries to the TypeTable.
+		for _, t := range m.typeStore.(*dirTypeStore).newTypes {
+			plan.Changes = append(plan.Changes, &migrate.Change{
+				Cmd:     m.atTypeRangeSQL(t),
+				Comment: `add pk range for "t" table`,
+			})
+		}
+		// We have written a file. Reset the types-counter.
+		m.typeStore.(*dirTypeStore).newTypes = nil
 	}
 	// Skip if the plan has no changes.
 	if len(plan.Changes) == 0 {

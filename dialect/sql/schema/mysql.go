@@ -970,3 +970,7 @@ func indexType(idx *Index, d string) (string, bool) {
 	}
 	return "", false
 }
+
+func (MySQL) atTypeRangeSQL(t string) string {
+	return fmt.Sprintf("INSERT INTO `%s` (`type`) VALUES ('%s')", TypeTable, t)
+}
